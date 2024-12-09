@@ -1,4 +1,15 @@
-# Copyright 2024 Rhymes AI. All rights reserved.
+# ==============================================================================
+# Copyright (c) Intel [2024]
+#
+# Modifications:
+# - Removed references to grouped_gemm and any custom GEMM kernels.
+# - Now rely solely on sequential_gemm (standard torch.matmul) for GEMM operations.
+# - Store config and support custom calls on Gaudi HPU for MoELayer
+# - Use bincount rather than histc which doesnt work on Gaudi.
+# - Removed cuda workaround for auto_map which is unneeded.
+#
+# Original Copyright:
+# Copyright (c) 2024 Rhymes AI. All rights reserved.
 #
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -16,6 +27,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# ==============================================================================
 
 import logging
 import os
@@ -25,17 +37,40 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import nn
-from transformers import GenerationMixin, LlamaConfig
 from transformers.models.llama.modeling_llama import (
     ACT2FN,
-    LLAMA_ATTENTION_CLASSES,
-    LlamaDecoderLayer,
-    LlamaForCausalLM,
-    LlamaMLP,
-    LlamaModel,
     LlamaRMSNorm,
-    LlamaRotaryEmbedding,
 )
+
+from .utils import is_torch_hpu_available
+
+if is_torch_hpu_available():
+    from optimum.habana.transformers.generation import GaudiGenerationMixin as GenerationMixin
+    from optimum.habana.transformers.models.llama.configuration_llama import LlamaConfig
+    from optimum.habana.transformers.models import GaudiLlamaAttention as LlamaAttention
+    LLAMA_ATTENTION_CLASSES = {
+        "eager": LlamaAttention,
+        "flash_attention_2": LlamaAttention,
+        "sdpa": LlamaAttention,
+    }
+    from optimum.habana.transformers.models import GaudiLlamaDecoderLayer as LlamaDecoderLayer
+    from optimum.habana.transformers.models import GaudiLlamaForCausalLM as LlamaForCausalLM
+    from optimum.habana.transformers.models import GaudiLlamaMLP as LlamaMLP
+    from optimum.habana.transformers.models import GaudiLlamaModel as LlamaModel
+    from optimum.habana.transformers.models import GaudiLlamaRotaryEmbedding as LlamaRotaryEmbedding
+    from optimum.habana.transformers.modeling_utils import adapt_transformers_to_gaudi
+    adapt_transformers_to_gaudi()
+    IS_HPU = True
+else:
+    from transformers import GenerationMixin
+    from transformers import LlamaConfig
+    from transformers.models.llama.modeling_llama import LLAMA_ATTENTION_CLASSES
+    from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+    from transformers.models.llama.modeling_llama import LlamaForCausalLM
+    from transformers.models.llama.modeling_llama import LlamaMLP
+    from transformers.models.llama.modeling_llama import LlamaModel
+    from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+    IS_HPU = False
 
 logger = logging.getLogger(__name__)
 
@@ -261,11 +296,9 @@ class TopKRouter(nn.Module):
         top_logits, top_indices = torch.topk(logits, k=self.config.moe_topk, dim=1)
         scores = torch.softmax(top_logits, dim=-1, dtype=torch.float32).type_as(logits)
 
-        tokens_per_expert = torch.histc(
-            top_indices.flatten(),
-            bins=self.config.moe_num_experts,
-            min=0,
-            max=self.config.moe_num_experts - 1,
+        tokens_per_expert = torch.bincount(
+            top_indices.flatten(), 
+            minlength=self.config.moe_num_experts
         )
 
         if self.training:
@@ -428,28 +461,14 @@ def sequential_gemm(input, weight, tokens_per_expert):
     return output
 
 
-try:
-    from grouped_gemm.ops import gmm as experts_gemm
-
-    if os.environ.get("USE_GROUPED_GEMM", "1") == "0":
-        logger.warning(
-            "environment variable USE_GROUPED_GEMM is set to 0, using sequential GEMM instead."
-        )
-        experts_gemm = sequential_gemm
-except ImportError:
-    logger.warning(
-        "`grouped_gemm` is not installed, using sequential GEMM, which is slower."
-    )
-    experts_gemm = sequential_gemm
+# For HPU compatibility, always use sequential_gemm, removing grouped_gemm attempts.
+experts_gemm = sequential_gemm
 
 
 class GroupedGEMM(nn.Module):
     """
-    Grouped GEMM (General Matrix Multiplication) module for efficient expert computation.
-    This module utilizes the grouped_gemm library (https://github.com/fanshiqing/grouped_gemm)
-    for optimized performance. If the grouped_gemm library is not installed, it gracefully
-    falls back to a sequential GEMM implementation, which may be slower but ensures
-    functionality.
+    For HPU compatibility, this class now just wraps sequential_gemm calls directly.
+    Removed external grouped_gemm references and rely on torch.matmul.
 
     Args:
         in_features (int): Number of input features.
@@ -475,12 +494,6 @@ class GroupedGEMM(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (num_tokens, out_features).
         """
-        tokens_per_expert = tokens_per_expert.cpu()
-
-        # Ensure the CUDA device matches the input tensor's device.
-        # This mismatch can occur when using `transformers.AutoModel.from_pretrained`
-        # with `device_map="auto"` on a multi-GPU setup.
-        torch.cuda.set_device(input.device)
         return experts_gemm(input, self.weight, tokens_per_expert)
 
 
@@ -539,13 +552,13 @@ class MoELayer(nn.Module):
 
     def __init__(self, config: AriaMoELMConfig):
         super().__init__()
-
+        self.config = config
         self.router = TopKRouter(config)
         self.token_dispatcher = TokenDispatcher(config)
         self.experts = GroupedMLP(config)
         self.shared_experts = SharedExpertMLP(config)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def pre_mlp_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
         Forward pass of the MoE Layer.
 
@@ -575,6 +588,18 @@ class MoELayer(nn.Module):
         shared_expert_output = self.shared_experts(hidden_states)
         output += shared_expert_output
         return output
+
+    def mlp_all_reduce(self, x):
+        if hasattr(self.shared_experts.down_proj, "all_reduce"):
+            self.shared_experts.down_proj.all_reduce(x)
+
+    def post_mlp_forward(self, x):
+        if self.config.pretraining_tp > 1:
+            return x
+        if hasattr(self.shared_experts.down_proj, "post_all_reduce"):
+            return self.shared_experts.down_proj.post_all_reduce(x)
+        return x
+
 
 
 class MoEDecoderLayer(LlamaDecoderLayer):
