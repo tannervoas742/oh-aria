@@ -1,4 +1,11 @@
-# Copyright 2024 Rhymes AI. All rights reserved.
+# ==============================================================================
+# Copyright (c) Intel [2024]
+#
+# Modifications:
+# - None
+#
+# Original Copyright:
+# Copyright (c) 2024 Rhymes AI. All rights reserved.
 #
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -16,12 +23,21 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# ==============================================================================
 
 import torch
 import torch.nn as nn
 from torch.nn.init import trunc_normal_
 from transformers.activations import ACT2FN
 
+from .utils import is_torch_hpu_available
+
+if is_torch_hpu_available():
+    from optimum.habana.transformers.modeling_utils import adapt_transformers_to_gaudi
+    adapt_transformers_to_gaudi()
+    IS_HPU = True
+else:
+    IS_HPU = False
 
 class FFN(nn.Module):
     """
@@ -34,10 +50,12 @@ class FFN(nn.Module):
     """
 
     def __init__(self, embed_dim, ff_dim, output_dim):
+        print('Start:', FFN)
         super().__init__()
         self.linear_in = nn.Linear(embed_dim, ff_dim, bias=False)
         self.linear_out = nn.Linear(ff_dim, output_dim, bias=False)
         self.act = ACT2FN["gelu_new"]
+        print('End:', FFN)
 
     def forward(self, hidden_states):
         hidden_states = self.act(self.linear_in(hidden_states))
@@ -57,6 +75,7 @@ class CrossAttention(nn.Module):
     """
 
     def __init__(self, kv_dim, embed_dim, num_heads, drop_out_rate=0):
+        print('Start:', CrossAttention)
         super().__init__()
         self.num_heads = num_heads
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
@@ -69,6 +88,7 @@ class CrossAttention(nn.Module):
 
         self.layer_norm = nn.LayerNorm(embed_dim)
         self.ln_kv = nn.LayerNorm(kv_dim)
+        print('End:', CrossAttention)
 
     def forward(self, x, hidden_states, attn_mask=None, add_residual=False):
         """
@@ -130,6 +150,7 @@ class AriaProjector(nn.Module):
         output_dim,
         norm_layer=nn.LayerNorm,
     ):
+        print('Start:', AriaProjector)
         super().__init__()
         self.patch_to_query_dict = patch_to_query_dict
         self.embed_dim = embed_dim
@@ -147,6 +168,7 @@ class AriaProjector(nn.Module):
         self.ffn = FFN(embed_dim, ff_dim, output_dim)
 
         self.apply(self._init_weights)
+        print('End:', AriaProjector)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):

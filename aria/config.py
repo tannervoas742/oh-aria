@@ -1,4 +1,11 @@
-# Copyright 2024 Rhymes AI. All rights reserved.
+# ==============================================================================
+# Copyright (c) Intel [2024]
+#
+# Modifications:
+# - 2024: Adapted for usage with Intel Gaudi AI accelerators.
+#
+# Original Copyright:
+# Copyright (c) 2024 Rhymes AI. All rights reserved.
 #
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -16,6 +23,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# ==============================================================================
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional

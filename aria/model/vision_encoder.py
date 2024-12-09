@@ -1,4 +1,11 @@
-# Copyright 2024 Rhymes AI. All rights reserved.
+# ==============================================================================
+# Copyright (c) Intel [2024]
+#
+# Modifications:
+# - None
+#
+# Original Copyright:
+# Copyright (c) 2024 Rhymes AI. All rights reserved.
 #
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -16,6 +23,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# ==============================================================================
 
 """PyTorch Aria vision transformer."""
 
@@ -27,6 +35,14 @@ from transformers import SiglipVisionConfig, SiglipVisionModel
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.idefics2.modeling_idefics2 import Idefics2VisionTransformer
 
+from .utils import is_torch_hpu_available
+
+if is_torch_hpu_available():
+    from optimum.habana.transformers.modeling_utils import adapt_transformers_to_gaudi
+    adapt_transformers_to_gaudi()
+    IS_HPU = True
+else:
+    IS_HPU = False
 
 class AriaVisionConfig(SiglipVisionConfig):
     """Configuration class for AriaVisionModel."""
@@ -37,8 +53,15 @@ class AriaVisionConfig(SiglipVisionConfig):
         self,
         **kwargs,
     ):
+        print('Start:', AriaVisionConfig)
         super().__init__(**kwargs)
-
+        attn_implementation = kwargs.pop("attn_implementation", None)
+        
+        # Set the default attention implementation to sdpa if not specified
+        self._attn_implementation = (
+            "sdpa" if attn_implementation is None else attn_implementation
+        )
+        print('End:', AriaVisionConfig)
 
 class IdentityOp(torch.nn.Module):
     """
@@ -63,8 +86,10 @@ class AriaVisionTransformer(Idefics2VisionTransformer):
     """
 
     def __init__(self, config: AriaVisionConfig):
+        print('Start:', AriaVisionTransformer)
         super().__init__(config)
         self.post_layernorm = IdentityOp()
+        print('End:', AriaVisionTransformer)
 
 
 class AriaVisionModel(SiglipVisionModel):
@@ -82,14 +107,18 @@ class AriaVisionModel(SiglipVisionModel):
 
     config_class = AriaVisionConfig
     main_input_name = "pixel_values"
-    _supports_sdpa = False
+    _attn_implementation_internal = 'sdpa'
+    _supports_sdpa = True
+    _supports_flash_attn_2 = False
 
     def __init__(self, config: AriaVisionConfig):
+        print('Start:', AriaVisionModel)
         super().__init__(config)
         self.vision_model = AriaVisionTransformer(config)
 
         # Initialize weights and apply final processing
         self.post_init()
+        print('End:', AriaVisionModel)
 
     def forward(
         self,

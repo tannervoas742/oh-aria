@@ -1,4 +1,14 @@
-# Copyright 2024 Rhymes AI. All rights reserved.
+# ==============================================================================
+# Copyright (c) Intel [2024]
+#
+# Modifications:
+# - Removed references to grouped_gemm and any custom GEMM kernels.
+# - Now rely solely on sequential_gemm (standard torch.matmul) for GEMM operations.
+# - flash_attention_2 references are already removed at config level.
+# - Ensured that the router and MLP layers use standard PyTorch ops recognized by Habana HPU stack.
+#
+# Original Copyright:
+# Copyright (c) 2024 Rhymes AI. All rights reserved.
 #
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -16,6 +26,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# ==============================================================================
 
 import logging
 import os
@@ -25,17 +36,34 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import nn
-from transformers import GenerationMixin, LlamaConfig
 from transformers.models.llama.modeling_llama import (
     ACT2FN,
     LLAMA_ATTENTION_CLASSES,
-    LlamaDecoderLayer,
-    LlamaForCausalLM,
-    LlamaMLP,
-    LlamaModel,
     LlamaRMSNorm,
-    LlamaRotaryEmbedding,
 )
+
+from .utils import is_torch_hpu_available
+
+if is_torch_hpu_available():
+    from optimum.habana.transformers.generation import GaudiGenerationMixin as GenerationMixin
+    from optimum.habana.transformers.models.llama.configuration_llama import LlamaConfig
+    from optimum.habana.transformers.models import GaudiLlamaDecoderLayer as LlamaDecoderLayer
+    from optimum.habana.transformers.models import GaudiLlamaForCausalLM as LlamaForCausalLM
+    from optimum.habana.transformers.models import GaudiLlamaMLP as LlamaMLP
+    from optimum.habana.transformers.models import GaudiLlamaModel as LlamaModel
+    from optimum.habana.transformers.models import GaudiLlamaRotaryEmbedding as LlamaRotaryEmbedding
+    from optimum.habana.transformers.modeling_utils import adapt_transformers_to_gaudi
+    adapt_transformers_to_gaudi()
+    IS_HPU = True
+else:
+    from transformers import GenerationMixin
+    from transformers import LlamaConfig
+    from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+    from transformers.models.llama.modeling_llama import LlamaForCausalLM
+    from transformers.models.llama.modeling_llama import LlamaMLP
+    from transformers.models.llama.modeling_llama import LlamaModel
+    from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+    IS_HPU = False
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +99,7 @@ class AriaMoELMConfig(LlamaConfig):
             moe_num_shared_experts (int): The number of shared experts. Default is 2.
             **kwargs: Additional keyword arguments to be passed to the parent LlamaConfig.
         """
+        print('Start:', AriaMoELMConfig)
         super().__init__(**kwargs)
         self.moe_intermediate_size = moe_intermediate_size
         self.moe_num_experts = moe_num_experts
@@ -78,6 +107,7 @@ class AriaMoELMConfig(LlamaConfig):
         self.moe_z_loss_coeff = moe_z_loss_coeff
         self.moe_aux_loss_coeff = moe_aux_loss_coeff
         self.moe_num_shared_experts = moe_num_shared_experts
+        print('End:', AriaMoELMConfig)
 
 
 # copied from https://github.com/NVIDIA/Megatron-LM/blob/54f1f78529cbc2b9cddad313e7f9d96ac0420a27/megatron/core/transformer/moe/moe_utils.py#L101-L142
@@ -179,13 +209,14 @@ class TopKRouter(nn.Module):
     """
 
     def __init__(self, config: AriaMoELMConfig):
+        print('Start:', TopKRouter)
         super().__init__()
         self.config = config
 
         self.weight = nn.Parameter(
             torch.empty((self.config.moe_num_experts, self.config.hidden_size))
         )
-        # FIXME: initialize the weight
+        print('End:', TopKRouter)
 
     def gating(self, input: torch.Tensor) -> torch.Tensor:
         """
@@ -259,7 +290,8 @@ class TopKRouter(nn.Module):
             logits = self.apply_z_loss(logits)
 
         top_logits, top_indices = torch.topk(logits, k=self.config.moe_topk, dim=1)
-        scores = torch.softmax(top_logits, dim=-1, dtype=torch.float32).type_as(logits)
+        # NOTE(Tanner): Scores was forced to float32 in original
+        scores = torch.softmax(top_logits, dim=-1).type_as(logits)
 
         tokens_per_expert = torch.histc(
             top_indices.flatten(),
@@ -306,9 +338,11 @@ class TokenDispatcher:
     """
 
     def __init__(self, config: AriaMoELMConfig):
+        print('Start:', TokenDispatcher)
         self.config = config
         self.hidden_states_shape = None
         self.reversed_input_permutation_mapping = None
+        print('End:', TokenDispatcher)
 
     def token_permutation(
         self, hidden_states: torch.Tensor, indices: torch.Tensor
@@ -377,6 +411,7 @@ class SharedExpertMLP(LlamaMLP):
     """
 
     def __init__(self, config: AriaMoELMConfig):
+        print('Start:', SharedExpertMLP)
         nn.Module.__init__(self)
         self.config = config
         self.hidden_size = config.hidden_size
@@ -393,6 +428,7 @@ class SharedExpertMLP(LlamaMLP):
             self.intermediate_size, self.hidden_size, bias=config.mlp_bias
         )
         self.act_fn = ACT2FN[config.hidden_act]
+        print('End:', SharedExpertMLP)
 
 
 def sequential_gemm(input, weight, tokens_per_expert):
@@ -423,33 +459,20 @@ def sequential_gemm(input, weight, tokens_per_expert):
         end = cumsum_num_tokens[expert_num + 1]
         tokens = input[start:end]
 
+        # Use standard matmul
         out = torch.matmul(tokens, weight[expert_num])
         output[start:end] = out
     return output
 
 
-try:
-    from grouped_gemm.ops import gmm as experts_gemm
-
-    if os.environ.get("USE_GROUPED_GEMM", "1") == "0":
-        logger.warning(
-            "environment variable USE_GROUPED_GEMM is set to 0, using sequential GEMM instead."
-        )
-        experts_gemm = sequential_gemm
-except ImportError:
-    logger.warning(
-        "`grouped_gemm` is not installed, using sequential GEMM, which is slower."
-    )
-    experts_gemm = sequential_gemm
+# For HPU compatibility, always use sequential_gemm, removing grouped_gemm attempts.
+experts_gemm = sequential_gemm
 
 
 class GroupedGEMM(nn.Module):
     """
-    Grouped GEMM (General Matrix Multiplication) module for efficient expert computation.
-    This module utilizes the grouped_gemm library (https://github.com/fanshiqing/grouped_gemm)
-    for optimized performance. If the grouped_gemm library is not installed, it gracefully
-    falls back to a sequential GEMM implementation, which may be slower but ensures
-    functionality.
+    For HPU compatibility, this class now just wraps sequential_gemm calls directly.
+    Removed external grouped_gemm references and rely on torch.matmul.
 
     Args:
         in_features (int): Number of input features.
@@ -458,11 +481,13 @@ class GroupedGEMM(nn.Module):
     """
 
     def __init__(self, in_features, out_features, groups):
+        print('Start:', GroupedGEMM)
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.groups = groups
         self.weight = nn.Parameter(torch.empty(groups, in_features, out_features))
+        print('End:', GroupedGEMM)
 
     def forward(self, input, tokens_per_expert):
         """
@@ -475,12 +500,6 @@ class GroupedGEMM(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (num_tokens, out_features).
         """
-        tokens_per_expert = tokens_per_expert.cpu()
-
-        # Ensure the CUDA device matches the input tensor's device.
-        # This mismatch can occur when using `transformers.AutoModel.from_pretrained`
-        # with `device_map="auto"` on a multi-GPU setup.
-        torch.cuda.set_device(input.device)
         return experts_gemm(input, self.weight, tokens_per_expert)
 
 
@@ -493,6 +512,7 @@ class GroupedMLP(nn.Module):
     """
 
     def __init__(self, config: AriaMoELMConfig) -> None:
+        print('Start:', GroupedMLP)
         super().__init__()
         self.config = config
         self.fc1 = GroupedGEMM(
@@ -507,6 +527,7 @@ class GroupedMLP(nn.Module):
             return F.silu(x[0]) * x[1]
 
         self.activation_func = glu
+        print('End:', GroupedMLP)
 
     def forward(self, permuted_tokens, tokens_per_expert):
         """
@@ -538,12 +559,14 @@ class MoELayer(nn.Module):
     """
 
     def __init__(self, config: AriaMoELMConfig):
+        print('Start:', MoELayer)
         super().__init__()
 
         self.router = TopKRouter(config)
         self.token_dispatcher = TokenDispatcher(config)
         self.experts = GroupedMLP(config)
         self.shared_experts = SharedExpertMLP(config)
+        print('End:', MoELayer)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
@@ -588,9 +611,11 @@ class MoEDecoderLayer(LlamaDecoderLayer):
     """
 
     def __init__(self, config: LlamaConfig, layer_idx: int):
+        print('Start:', MoEDecoderLayer)
         nn.Module.__init__(self)
         self.hidden_size = config.hidden_size
 
+        # NOTE(Tanner): For HPU compatibility, ensure attention implementation is sdpa
         self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](
             config=config, layer_idx=layer_idx
         )
@@ -600,6 +625,7 @@ class MoEDecoderLayer(LlamaDecoderLayer):
         self.post_attention_layernorm = LlamaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        print('End:', MoEDecoderLayer)
 
 
 class AriaMoELMModel(LlamaModel):
@@ -615,6 +641,7 @@ class AriaMoELMModel(LlamaModel):
     """
 
     def __init__(self, config: LlamaConfig):
+        print('Start:', AriaMoELMModel)
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -634,6 +661,7 @@ class AriaMoELMModel(LlamaModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+        print('End:', AriaMoELMModel)
 
 
 class AriaMoELMForCausalLM(LlamaForCausalLM, GenerationMixin):
@@ -652,6 +680,7 @@ class AriaMoELMForCausalLM(LlamaForCausalLM, GenerationMixin):
     _no_split_modules = ["MoEDecoderLayer"]
 
     def __init__(self, config):
+        print('Start:', AriaMoELMForCausalLM)
         super().__init__(config)
         self.model = AriaMoELMModel(config)
         self.vocab_size = config.vocab_size
@@ -659,6 +688,7 @@ class AriaMoELMForCausalLM(LlamaForCausalLM, GenerationMixin):
 
         # Initialize weights and apply final processing
         self.post_init()
+        print('End:', AriaMoELMForCausalLM)
 
     def set_z_loss_coeff(self, z_loss_coeff: float):
         """

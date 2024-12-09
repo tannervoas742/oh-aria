@@ -1,4 +1,11 @@
-# Copyright 2024 Rhymes AI. All rights reserved.
+# ==============================================================================
+# Copyright (c) Intel [2024]
+#
+# Modifications:
+# - None
+#
+# Original Copyright:
+# Copyright (c) 2024 Rhymes AI. All rights reserved.
 #
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -16,6 +23,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# ==============================================================================
 
 import logging
 
@@ -23,6 +31,14 @@ from transformers.configuration_utils import PretrainedConfig
 
 from .moe_lm import AriaMoELMConfig
 from .vision_encoder import AriaVisionConfig
+from .utils import is_torch_hpu_available
+
+if is_torch_hpu_available():
+    from optimum.habana.transformers.modeling_utils import adapt_transformers_to_gaudi
+    adapt_transformers_to_gaudi()
+    IS_HPU = True
+else:
+    IS_HPU = False
 
 logger = logging.getLogger(__name__)
 
@@ -69,15 +85,16 @@ class AriaConfig(PretrainedConfig):
         tie_word_embeddings=False,
         **kwargs,
     ):
+        print('Start:', AriaConfig)
         super().__init__(**kwargs)
         self.ignore_index = ignore_index
         self.image_token_index = image_token_index
         self.tie_word_embeddings = tie_word_embeddings
         attn_implementation = kwargs.pop("attn_implementation", None)
 
-        # Set the default attention implementation to flash_attention_2 if not specified
+        # Set the default attention implementation to sdpa if not specified
         self._attn_implementation = (
-            "flash_attention_2" if attn_implementation is None else attn_implementation
+            "sdpa" if attn_implementation is None else attn_implementation
         )
 
         # Convert the keys and values of projector_patch_to_query_dict to integers
@@ -89,12 +106,12 @@ class AriaConfig(PretrainedConfig):
         if isinstance(vision_config, dict) and "model_type" in vision_config:
             vision_config = AriaVisionConfig(**vision_config)
             if attn_implementation is None:
-                vision_attn_implementation = "flash_attention_2"
-            elif attn_implementation == "sdpa":
+                vision_attn_implementation = "sdpa"
+            elif attn_implementation == "flash_attention_2":
                 logger.warning(
-                    "SDPA is not supported for vit, using flash_attention_2 instead"
+                    "flash_attention_2 is not supported for vit, using SDPA instead"
                 )
-                vision_attn_implementation = "flash_attention_2"
+                vision_attn_implementation = "sdpa"
             else:
                 vision_attn_implementation = attn_implementation
             vision_config._attn_implementation = vision_attn_implementation
@@ -112,3 +129,4 @@ class AriaConfig(PretrainedConfig):
 
         # This is needed for the static kv cache
         self.num_hidden_layers = self.text_config.num_hidden_layers
+        print('End:', AriaConfig)

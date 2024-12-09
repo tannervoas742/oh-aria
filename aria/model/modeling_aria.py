@@ -1,4 +1,13 @@
-# Copyright 2024 Rhymes AI. All rights reserved.
+# ==============================================================================
+# Copyright (c) Intel [2024]
+#
+# Modifications:
+# - Removed references to flash_attention_2 as a supported feature.
+# - Set _supports_flash_attn_2 = False to avoid any confusion about using flash attention kernels.
+# - Ensured that the model uses SDPA or standard attention mechanisms, which are supported on HPU.
+#
+# Original Copyright:
+# Copyright (c) 2024 Rhymes AI. All rights reserved.
 #
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -16,6 +25,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# ==============================================================================
 
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
@@ -23,7 +33,8 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from torch import nn
-from transformers import GenerationMixin, PreTrainedModel
+from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 from transformers.utils import logging
 
@@ -31,9 +42,20 @@ from .configuration_aria import AriaConfig
 from .moe_lm import AriaMoELMForCausalLM
 from .projector import AriaProjector
 from .vision_encoder import AriaVisionModel
+from .utils import is_torch_hpu_available
+
+if is_torch_hpu_available():
+    from optimum.habana.transformers.generation import GaudiGenerationMixin as GenerationMixin
+    from optimum.habana.transformers.modeling_utils import adapt_transformers_to_gaudi
+    adapt_transformers_to_gaudi()
+    IS_HPU = True
+else:
+    from transformers import GenerationMixin
+    IS_HPU = False
 
 logger = logging.get_logger(__name__)
 
+#TODO: GaudiGenerationMixin.forward contents
 
 class AriaPretrainedModel(PreTrainedModel):
     """
@@ -45,7 +67,9 @@ class AriaPretrainedModel(PreTrainedModel):
     _no_split_modules = []
     supports_gradient_checkpointing = True
     _skip_keys_device_placement = "past_key_values"
-    _supports_flash_attn_2 = True
+    # Updated for HPU: flash_attention_2 not supported, set to False
+    _supports_sdpa = True
+    _supports_flash_attn_2 = False
     _supports_cache_class = True
     _supports_static_cache = True
 
@@ -131,8 +155,19 @@ class AriaForConditionalGeneration(AriaPretrainedModel, GenerationMixin):
     """
 
     def __init__(self, config: AriaConfig):
+        print('Start:', AriaForConditionalGeneration)
+        if config._attn_implementation == "flash_attention_2":
+            logger.warning(
+                "flash_attention_2 is not supported for aria, using SDPA instead"
+            )
+            config._attn_implementation = "sdpa"
         super().__init__(config)
-
+        
+        if config.vision_config._attn_implementation == "flash_attention_2":
+            logger.warning(
+                "flash_attention_2 is not supported for vit, using eager instead"
+            )
+            config.vision_config._attn_implementation = "eager"
         self.vision_tower = AriaVisionModel(config.vision_config)
         self.multi_modal_projector = build_mm_projector(config)
         self.vocab_size = config.text_config.vocab_size
@@ -141,6 +176,7 @@ class AriaForConditionalGeneration(AriaPretrainedModel, GenerationMixin):
             self.config.pad_token_id if self.config.pad_token_id is not None else -1
         )
         self.post_init()
+        print('End:', AriaForConditionalGeneration)
 
     def freeze_vit(self):
         """Freeze the parameters of the vision tower."""
@@ -201,12 +237,25 @@ class AriaForConditionalGeneration(AriaPretrainedModel, GenerationMixin):
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
+        token_idx: Optional[torch.Tensor] = None,
+        trim_logits: Optional[bool] = False,
+        attn_softmax_bf16: Optional[bool] = False,
+        reuse_cache: Optional[bool] = False,
+        use_flash_attention: Optional[bool] = False,
+        flash_attention_recompute: Optional[bool] = False,
+        flash_attention_causal_mask: Optional[bool] = False,
+        flash_attention_fast_softmax: Optional[bool] = False,
+        valid_sequence_lengths: torch.Tensor = None,
+        cache_idx: int = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         num_logits_to_keep: int = 0,
+        lazy_mode: Optional[bool] = True,
+        num_virtual_tokens: int = None,
+        **kwargs,
     ) -> Union[Tuple, AriaCausalLMOutputWithPast]:
         """
         Forward pass of the AriaForConditionalGeneration model.
@@ -288,11 +337,23 @@ class AriaForConditionalGeneration(AriaPretrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
+            token_idx=token_idx,
+            trim_logits=trim_logits,
+            attn_softmax_bf16=attn_softmax_bf16,
+            reuse_cache=reuse_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
             num_logits_to_keep=num_logits_to_keep,
+            use_flash_attention=use_flash_attention,
+            flash_attention_recompute=flash_attention_recompute,
+            flash_attention_causal_mask=flash_attention_causal_mask,
+            flash_attention_fast_softmax=flash_attention_fast_softmax,
+            valid_sequence_lengths=valid_sequence_lengths,
+            cache_idx=cache_idx,
+            lazy_mode=lazy_mode,
+            num_virtual_tokens=num_virtual_tokens,
         )
 
         logits = outputs[0]
@@ -344,6 +405,7 @@ class AriaForConditionalGeneration(AriaPretrainedModel, GenerationMixin):
         attention_mask=None,
         cache_position=None,
         num_logits_to_keep=None,
+        token_idx=None,
         **kwargs,
     ):
         model_inputs = self.language_model.prepare_inputs_for_generation(
@@ -353,6 +415,7 @@ class AriaForConditionalGeneration(AriaPretrainedModel, GenerationMixin):
             attention_mask=attention_mask,
             cache_position=cache_position,
             num_logits_to_keep=num_logits_to_keep,
+            token_idx=token_idx,
             **kwargs,
         )
 
@@ -363,3 +426,4 @@ class AriaForConditionalGeneration(AriaPretrainedModel, GenerationMixin):
             model_inputs["pixel_mask"] = pixel_mask
 
         return model_inputs
+
