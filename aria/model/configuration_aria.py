@@ -92,9 +92,9 @@ class AriaConfig(PretrainedConfig):
         self.tie_word_embeddings = tie_word_embeddings
         attn_implementation = kwargs.pop("attn_implementation", None)
 
-        # Set the default attention implementation to sdpa if not specified
+        # Set the default attention implementation to flash_attention_2 if not specified
         self._attn_implementation = (
-            "sdpa" if attn_implementation is None else attn_implementation
+            "flash_attention_2" if attn_implementation is None else attn_implementation
         )
 
         # Convert the keys and values of projector_patch_to_query_dict to integers
@@ -106,12 +106,12 @@ class AriaConfig(PretrainedConfig):
         if isinstance(vision_config, dict) and "model_type" in vision_config:
             vision_config = AriaVisionConfig(**vision_config)
             if attn_implementation is None:
-                vision_attn_implementation = "sdpa"
-            elif attn_implementation == "flash_attention_2":
+                vision_attn_implementation = "flash_attention_2"
+            elif attn_implementation == "sdpa":
                 logger.warning(
-                    "flash_attention_2 is not supported for vit, using SDPA instead"
+                    "SDPA is not supported for vit, using flash_attention_2 instead"
                 )
-                vision_attn_implementation = "sdpa"
+                vision_attn_implementation = "flash_attention_2"
             else:
                 vision_attn_implementation = attn_implementation
             vision_config._attn_implementation = vision_attn_implementation

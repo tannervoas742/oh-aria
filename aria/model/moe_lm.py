@@ -290,8 +290,7 @@ class TopKRouter(nn.Module):
             logits = self.apply_z_loss(logits)
 
         top_logits, top_indices = torch.topk(logits, k=self.config.moe_topk, dim=1)
-        # NOTE(Tanner): Scores was forced to float32 in original
-        scores = torch.softmax(top_logits, dim=-1).type_as(logits)
+        scores = torch.softmax(top_logits, dim=-1, dtype=torch.float32).type_as(logits)
 
         tokens_per_expert = torch.histc(
             top_indices.flatten(),
@@ -459,7 +458,6 @@ def sequential_gemm(input, weight, tokens_per_expert):
         end = cumsum_num_tokens[expert_num + 1]
         tokens = input[start:end]
 
-        # Use standard matmul
         out = torch.matmul(tokens, weight[expert_num])
         output[start:end] = out
     return output
@@ -615,7 +613,6 @@ class MoEDecoderLayer(LlamaDecoderLayer):
         nn.Module.__init__(self)
         self.hidden_size = config.hidden_size
 
-        # NOTE(Tanner): For HPU compatibility, ensure attention implementation is sdpa
         self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](
             config=config, layer_idx=layer_idx
         )

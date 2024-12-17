@@ -57,9 +57,9 @@ class AriaVisionConfig(SiglipVisionConfig):
         super().__init__(**kwargs)
         attn_implementation = kwargs.pop("attn_implementation", None)
         
-        # Set the default attention implementation to sdpa if not specified
+        # Set the default attention implementation to flash_attention_2 if not specified
         self._attn_implementation = (
-            "sdpa" if attn_implementation is None else attn_implementation
+            "flash_attention_2" if attn_implementation is None else attn_implementation
         )
         print('End:', AriaVisionConfig)
 
@@ -107,9 +107,7 @@ class AriaVisionModel(SiglipVisionModel):
 
     config_class = AriaVisionConfig
     main_input_name = "pixel_values"
-    _attn_implementation_internal = 'sdpa'
-    _supports_sdpa = True
-    _supports_flash_attn_2 = False
+    _supports_sdpa = False
 
     def __init__(self, config: AriaVisionConfig):
         print('Start:', AriaVisionModel)

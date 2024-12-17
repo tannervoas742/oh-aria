@@ -67,9 +67,7 @@ class AriaPretrainedModel(PreTrainedModel):
     _no_split_modules = []
     supports_gradient_checkpointing = True
     _skip_keys_device_placement = "past_key_values"
-    # Updated for HPU: flash_attention_2 not supported, set to False
-    _supports_sdpa = True
-    _supports_flash_attn_2 = False
+    _supports_flash_attn_2 = True
     _supports_cache_class = True
     _supports_static_cache = True
 
@@ -156,18 +154,8 @@ class AriaForConditionalGeneration(AriaPretrainedModel, GenerationMixin):
 
     def __init__(self, config: AriaConfig):
         print('Start:', AriaForConditionalGeneration)
-        if config._attn_implementation == "flash_attention_2":
-            logger.warning(
-                "flash_attention_2 is not supported for aria, using SDPA instead"
-            )
-            config._attn_implementation = "sdpa"
         super().__init__(config)
-        
-        if config.vision_config._attn_implementation == "flash_attention_2":
-            logger.warning(
-                "flash_attention_2 is not supported for vit, using eager instead"
-            )
-            config.vision_config._attn_implementation = "eager"
+
         self.vision_tower = AriaVisionModel(config.vision_config)
         self.multi_modal_projector = build_mm_projector(config)
         self.vocab_size = config.text_config.vocab_size
@@ -426,4 +414,3 @@ class AriaForConditionalGeneration(AriaPretrainedModel, GenerationMixin):
             model_inputs["pixel_mask"] = pixel_mask
 
         return model_inputs
-
