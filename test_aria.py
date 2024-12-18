@@ -4,6 +4,15 @@ from transformers import AutoConfig, BitsAndBytesConfig
 from aria.model import AriaForConditionalGeneration, AriaProcessor
 from accelerate import Accelerator
 
+from aria.model.utils import is_torch_hpu_available
+
+if is_torch_hpu_available():
+    from optimum.habana.transformers.modeling_utils import adapt_transformers_to_gaudi
+    adapt_transformers_to_gaudi()
+    IS_HPU = True
+else:
+    IS_HPU = False
+
 # ==============================
 # Configuration Switch
 # ==============================
@@ -137,6 +146,7 @@ with torch.inference_mode(), accelerator.autocast():
         tokenizer=processor.tokenizer,
         do_sample=True,
         temperature=0.9,
+        use_flash_attention=use_flash_attn,
     )
     output_ids = output[0][inputs["input_ids"].shape[1]:]
     result = processor.decode(output_ids, skip_special_tokens=True)

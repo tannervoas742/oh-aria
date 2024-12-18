@@ -35,6 +35,7 @@ import torch.nn as nn
 from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM
 from transformers import PreTrainedModel
+from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import ModelOutput
 from transformers.utils import logging
 
@@ -70,6 +71,11 @@ class AriaPretrainedModel(PreTrainedModel):
     _supports_flash_attn_2 = True
     _supports_cache_class = True
     _supports_static_cache = True
+
+    def __init__(self, config: PretrainedConfig, *inputs, **kwargs):
+        print('Start:', AriaPretrainedModel)
+        super().__init__(config, *inputs, **kwargs)
+        print('End:', AriaPretrainedModel)
 
     @property
     def _supports_sdpa(self):
@@ -154,6 +160,8 @@ class AriaForConditionalGeneration(AriaPretrainedModel, GenerationMixin):
 
     def __init__(self, config: AriaConfig):
         print('Start:', AriaForConditionalGeneration)
+        config._attn_implementation = None
+        config.vision_config._attn_implementation = None
         super().__init__(config)
 
         self.vision_tower = AriaVisionModel(config.vision_config)

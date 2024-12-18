@@ -38,7 +38,6 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.models.llama.modeling_llama import (
     ACT2FN,
-    LLAMA_ATTENTION_CLASSES,
     LlamaRMSNorm,
 )
 
@@ -47,6 +46,12 @@ from .utils import is_torch_hpu_available
 if is_torch_hpu_available():
     from optimum.habana.transformers.generation import GaudiGenerationMixin as GenerationMixin
     from optimum.habana.transformers.models.llama.configuration_llama import LlamaConfig
+    from optimum.habana.transformers.models import GaudiLlamaAttention as LlamaAttention
+    LLAMA_ATTENTION_CLASSES = {
+        "eager": LlamaAttention,
+        "flash_attention_2": LlamaAttention,
+        "sdpa": LlamaAttention,
+    }
     from optimum.habana.transformers.models import GaudiLlamaDecoderLayer as LlamaDecoderLayer
     from optimum.habana.transformers.models import GaudiLlamaForCausalLM as LlamaForCausalLM
     from optimum.habana.transformers.models import GaudiLlamaMLP as LlamaMLP
@@ -58,6 +63,7 @@ if is_torch_hpu_available():
 else:
     from transformers import GenerationMixin
     from transformers import LlamaConfig
+    from transformers.models.llama.modeling_llama import LLAMA_ATTENTION_CLASSES
     from transformers.models.llama.modeling_llama import LlamaDecoderLayer
     from transformers.models.llama.modeling_llama import LlamaForCausalLM
     from transformers.models.llama.modeling_llama import LlamaMLP
@@ -566,7 +572,7 @@ class MoELayer(nn.Module):
         self.shared_experts = SharedExpertMLP(config)
         print('End:', MoELayer)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def pre_mlp_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
         Forward pass of the MoE Layer.
 

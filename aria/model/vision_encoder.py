@@ -58,9 +58,9 @@ class AriaVisionConfig(SiglipVisionConfig):
         attn_implementation = kwargs.pop("attn_implementation", None)
         
         # Set the default attention implementation to flash_attention_2 if not specified
-        self._attn_implementation = (
-            "flash_attention_2" if attn_implementation is None else attn_implementation
-        )
+        #self._attn_implementation = (
+        #    "flash_attention_2" if attn_implementation is None else attn_implementation
+        #)
         print('End:', AriaVisionConfig)
 
 class IdentityOp(torch.nn.Module):
